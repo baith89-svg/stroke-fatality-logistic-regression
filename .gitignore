@@ -1,0 +1,15 @@
+# R / RStudio / Quarto temporary files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# Quarto intermediate files
+report.knit.md
+*_files/
+.quarto/
+
+# OS files
+Thumbs.db
+.DS_Store

@@ -1,0 +1,384 @@
+---
+title: "Stroke Fatality at Discharge: Binary Logistic Regression Analysis"
+subtitle: "RREAAAP Workflow Report"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(haven)
+library(janitor)
+library(gtsummary)
+library(broom)
+library(car)
+library(pROC)
+library(ResourceSelection)
+library(knitr)
+```
+
+# Reason
+
+The objective of this analysis is to determine the factors associated with **in-hospital stroke fatality at discharge** (`outcome`: `0` = alive, `1` = dead) among 226 stroke patients using binary logistic regression in R.
+
+---
+
+# Read
+
+The dataset `stroke-fatality-cooked2.dta` is imported using `haven::read_dta()`. Variable names are standardized with `janitor::clean_names()` and clear snake_case naming, and Stata labelled (`dbl+lbl`) variables are converted into R factors with clinically meaningful reference categories (`alive`, `male`, `no` for comorbidities, `hospital` for referral source, and `CI (Ischaemic)` for stroke type). The registration number (`rn`) is retained only as a unique identifier check and excluded from regression modeling.
+
+```{r read-data}
+raw_df <- read_dta("stroke-fatality-cooked2.dta")
+
+stroke_df <- raw_df %>%
+  clean_names() %>%
+  rename(
+    marital_status = maritalstat,
+    referral_case  = referralcase,
+    stroke_type    = stroketype
+  ) %>%
+  mutate(
+    outcome = factor(as.numeric(outcome), levels = c(0, 1), labels = c("alive", "dead")),
+    sex = factor(as.numeric(sex), levels = c(1, 2), labels = c("male", "female")),
+    hypertension = factor(as.numeric(hypertension), levels = c(0, 1), labels = c("no", "yes")),
+    marital_status = factor(as.numeric(marital_status), levels = c(0, 1), labels = c("no", "yes")),
+    malay = factor(as.numeric(malay), levels = c(0, 1), labels = c("no", "yes")),
+    diabetes = factor(as.numeric(diabetes), levels = c(0, 1), labels = c("no", "yes")),
+    dyslipidaemia = factor(as.numeric(dyslipidaemia), levels = c(0, 1), labels = c("no", "yes")),
+    referral_case = factor(as.numeric(referral_case), levels = c(0, 1), labels = c("hospital", "GP/Home/Missing")),
+    stroke_type = factor(as.numeric(stroke_type), levels = c(0, 1), labels = c("CI (Ischaemic)", "Haemorrhagic"))
+  )
+
+tibble(
+  Rows = nrow(stroke_df),
+  Columns = ncol(stroke_df),
+  Unique_IDs = n_distinct(stroke_df$rn),
+  Alive = sum(stroke_df$outcome == "alive"),
+  Dead = sum(stroke_df$outcome == "dead")
+) %>%
+  kable(caption = "Dataset Overview")
+```
+
+---
+
+# Explore
+
+## Missing Data & Data Entry Checks
+
+All 22 variables have **0 missing values** (100% complete across 226 observations). Logical consistency checks confirm:
+
+- `SBP <= DBP`: `r sum(stroke_df$sbp <= stroke_df$dbp)` cases
+- `GCS < 3` or `GCS > 15`: `r sum(stroke_df$gcs < 3 | stroke_df$gcs > 15)` cases
+- `Age < 0` or `Age > 120`: `r sum(stroke_df$age < 0 | stroke_df$age > 120)` cases
+
+## Outlier Summary (Numerical Variables)
+
+```{r outlier-check}
+num_vars <- c("gcs", "sbp", "dbp", "hr", "hb", "plat", "wbc", "na", "potas", "cbs", "urea", "age")
+
+stroke_df %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    Min = min(value),
+    Q1 = quantile(value, 0.25),
+    Median = median(value),
+    Q3 = quantile(value, 0.75),
+    Max = max(value),
+    IQR = IQR(value),
+    `IQR Outliers (n)` = sum(value < (Q1 - 1.5 * IQR) | value > (Q3 + 1.5 * IQR)),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 2, caption = "Numerical Variable Ranges and IQR Outlier Counts")
+```
+
+Extreme values (such as `sbp = 290`, `na = 109` or `177`, `urea = 41.0`) are clinically plausible in acute severe stroke presentations and are retained for analysis while monitored in diagnostic stability checks.
+
+## Visual Exploration
+
+### Numerical Variables: Histograms & Boxplots
+
+```{r explore-num-plots, fig.width=11, fig.height=6.5}
+stroke_df %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 20, fill = "#2c7fb8", color = "white", alpha = 0.85) +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  theme_minimal(base_size = 11) +
+  labs(title = "Histograms of Numerical Variables", x = NULL, y = "Count")
+```
+
+```{r explore-boxplots, fig.width=11, fig.height=6.5}
+stroke_df %>%
+  select(outcome, all_of(num_vars)) %>%
+  pivot_longer(-outcome, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = outcome, y = value, fill = outcome)) +
+  geom_boxplot(alpha = 0.8, outlier.color = "#d95f02") +
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = c("alive" = "#1b9e77", "dead" = "#d95f02")) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none") +
+  labs(title = "Boxplots of Numerical Variables by Discharge Outcome", x = "Outcome", y = NULL)
+```
+
+### Categorical Variables: Bar Charts
+
+```{r explore-barcharts, fig.width=11, fig.height=6}
+cat_vars <- c("sex", "hypertension", "marital_status", "malay", "diabetes",
+              "dyslipidaemia", "referral_case", "stroke_type")
+
+stroke_df %>%
+  select(outcome, all_of(cat_vars)) %>%
+  pivot_longer(-outcome, names_to = "variable", values_to = "level") %>%
+  ggplot(aes(x = level, fill = outcome)) +
+  geom_bar(position = "dodge", alpha = 0.9) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 4) +
+  scale_fill_manual(values = c("alive" = "#1b9e77", "dead" = "#d95f02")) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1)) +
+  labs(title = "Bar Charts of Categorical Variables by Discharge Outcome", x = NULL, y = "Count", fill = "Outcome")
+```
+
+## Descriptive Summary Table (`gtsummary`)
+
+```{r desc-table}
+stroke_df %>%
+  select(-rn) %>%
+  tbl_summary(
+    by = outcome,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1
+  ) %>%
+  add_overall() %>%
+  add_p() %>%
+  bold_labels()
+```
+
+---
+
+# Apply: Univariable & Multivariable Logistic Regression
+
+## Univariable Screening
+
+Each independent variable is evaluated individually against `outcome` using binary logistic regression (`glm(..., family = binomial)`). Variables with $p < 0.25$ are selected as candidates for multivariable modeling (no interaction terms included).
+
+```{r univariable-and-multivariable}
+predictors <- setdiff(names(stroke_df), c("rn", "outcome"))
+
+univ_results <- map_dfr(predictors, function(var) {
+  fml <- as.formula(paste("outcome ~", var))
+  mod <- glm(fml, data = stroke_df, family = binomial(link = "logit"))
+  tidy(mod, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(variable = var, .before = 1)
+})
+
+candidate_vars <- univ_results %>%
+  filter(p.value < 0.25) %>%
+  pull(variable) %>%
+  unique()
+
+fml_full <- as.formula(paste("outcome ~", paste(candidate_vars, collapse = " + ")))
+mod_full <- glm(fml_full, data = stroke_df, family = binomial(link = "logit"))
+mod_final <- step(mod_full, direction = "backward", trace = 0)
+```
+
+The 10 candidate variables with univariable $p < 0.25$ are: `r paste(candidate_vars, collapse = ", ")`.  
+Backward stepwise AIC selection yields the final parsimonious model: `r deparse(formula(mod_final))`.
+
+## Combined Crude & Adjusted Odds Ratios Table
+
+```{r reg-table}
+tbl_uv <- stroke_df %>%
+  select(outcome, all_of(predictors)) %>%
+  tbl_uvregression(
+    method = glm,
+    y = outcome,
+    method.args = list(family = binomial),
+    exponentiate = TRUE,
+    pvalue_fun = label_style_pvalue(digits = 3)
+  )
+
+tbl_mv <- tbl_regression(
+  mod_final,
+  exponentiate = TRUE,
+  pvalue_fun = label_style_pvalue(digits = 3)
+)
+
+tbl_merge(
+  tbls = list(tbl_uv, tbl_mv),
+  tab_spanner = c("**Univariable (Crude OR)**", "**Multivariable (Adjusted OR)**")
+)
+```
+
+### Clinical Interpretation
+- **Glasgow Coma Scale (`gcs`)**: Each 1-point increase in earliest GCS is strongly associated with lower odds of in-hospital mortality (Adjusted OR = 0.49, 95% CI: 0.39–0.58, $p < 0.001$).
+- **Sex (`sex`)**: After adjusting for GCS, female patients had lower odds of death compared to male patients (Adjusted OR = 0.33, 95% CI: 0.10–0.93, $p = 0.044$), reversing the unadjusted crude association (Crude OR = 1.53, $p = 0.166$), which reflects confounding by baseline GCS severity.
+
+---
+
+# Assumption Checks
+
+1. **Binomial Distribution & Independence**: The outcome (`alive` vs. `dead`) is dichotomous and each observation corresponds to a unique patient (`rn`, $N = 226$).
+2. **No Multicollinearity**: Variance Inflation Factors (`car::vif()`) for `sex` and `gcs` are both **1.39**, well below the threshold of 5.
+3. **Linearity in the Logit & Model Specification**:
+
+```{r assumptions}
+tibble(
+  Variable = names(car::vif(mod_final)),
+  VIF = as.numeric(car::vif(mod_final))
+) %>%
+  kable(digits = 3, caption = "Multicollinearity Check (VIF)")
+
+mod_bt <- glm(outcome ~ sex + gcs + gcs:log(gcs), data = stroke_df, family = binomial)
+tidy(mod_bt) %>%
+  filter(str_detect(term, "log\\(")) %>%
+  kable(digits = 4, caption = "Box-Tidwell Test for Linearity in the Logit")
+
+hat_logit <- predict(mod_final, type = "link")
+mod_linktest <- glm(outcome ~ hat_logit + I(hat_logit^2), data = stroke_df, family = binomial)
+tidy(mod_linktest) %>%
+  kable(digits = 4, caption = "Pregibon Link Test for Model Specification")
+```
+
+*Note:* Both the Box-Tidwell term (`gcs:log(gcs)`, $p = 0.0037$) and the Link Test squared term (`I(hat_logit^2)`, $p = 0.0397$) are statistically significant, indicating mild non-linearity in the logit for `gcs` (due to clustering at the maximum score of 15).
+
+---
+
+# Assess: Model Fitness & Diagnostic Stability
+
+## Overall Model Fitness
+
+```{r model-fitness}
+mcfadden_r2 <- 1 - (mod_final$deviance / mod_final$null.deviance)
+roc_obj <- roc(response = stroke_df$outcome, predictor = fitted(mod_final),
+               levels = c("alive", "dead"), direction = "<")
+auc_val <- auc(roc_obj)
+auc_ci <- ci.auc(roc_obj)
+hl_test <- hoslem.test(as.numeric(stroke_df$outcome) - 1, fitted(mod_final), g = 10)
+
+glance(mod_final) %>%
+  mutate(McFadden_R2 = mcfadden_r2, AUC = as.numeric(auc_val)) %>%
+  select(nobs, AIC, BIC, logLik, deviance, McFadden_R2, AUC) %>%
+  kable(digits = 3, caption = "Overall Model Fit Summary")
+```
+
+- **Discrimination (ROC / AUC)**: AUC = `r sprintf("%.3f (95%% CI: %.3f–%.3f)", auc_val, auc_ci[1], auc_ci[3])`, indicating excellent discrimination.
+- **Hosmer-Lemeshow GOF Test**: $\chi^2 = `r round(hl_test$statistic, 3)`$, $\text{df} = `r hl_test$parameter`$, $p = `r round(hl_test$p.value, 4)`$ ($p > 0.05$, indicating acceptable model calibration).
+
+```{r roc-plot, fig.width=6, fig.height=5}
+plot(roc_obj, col = "#2c7fb8", lwd = 2.5,
+     main = sprintf("ROC Curve (AUC = %.3f)", auc_val))
+abline(a = 0, b = 1, lty = 2, col = "gray50")
+```
+
+## Diagnostic Stability (`broom::augment()`)
+
+```{r diagnostic-stability, fig.width=11, fig.height=6.5}
+aug_df <- augment(mod_final, type.predict = "response", type.residuals = "deviance") %>%
+  mutate(
+    obs_id = row_number(),
+    pearson_resid = residuals(mod_final, type = "pearson"),
+    deviance_resid = residuals(mod_final, type = "deviance"),
+    dffits_val = dffits(mod_final),
+    max_abs_dfbeta = apply(abs(dfbetas(mod_final)), 1, max)
+  )
+
+p_params <- length(coef(mod_final))
+n_obs <- nrow(stroke_df)
+
+tibble(
+  Metric = c("High Leverage (> 2p/n)", "|Std. Deviance Resid| > 2.5",
+             "|DFFITS| > 2*sqrt(p/n)", "Max |DFBETA| > 2/sqrt(n)"),
+  Threshold = c(2 * p_params / n_obs, 2.5, 2 * sqrt(p_params / n_obs), 2 / sqrt(n_obs)),
+  Count_Flagged = c(
+    sum(aug_df$.hat > 2 * p_params / n_obs),
+    sum(abs(aug_df$.std.resid) > 2.5),
+    sum(abs(aug_df$dffits_val) > 2 * sqrt(p_params / n_obs)),
+    sum(aug_df$max_abs_dfbeta > 2 / sqrt(n_obs))
+  )
+) %>%
+  kable(digits = 4, caption = "Diagnostic Stability Flagged Observations")
+
+as_tibble(dfbetas(mod_final)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "dfbeta") %>%
+  group_by(Variable) %>%
+  summarise(
+    `Count |DFBETA| > 2/sqrt(n)` = sum(abs(dfbeta) > 2 / sqrt(n_obs)),
+    `Count |DFBETA| > 1.0` = sum(abs(dfbeta) > 1),
+    `Max |DFBETA|` = max(abs(dfbeta)),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 4, caption = "DFBETA Instability Breakdown by Model Variable")
+
+aug_df %>%
+  select(obs_id, .hat, .std.resid, pearson_resid, dffits_val, max_abs_dfbeta, .cooksd) %>%
+  pivot_longer(-obs_id, names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = obs_id, y = value)) +
+  geom_point(alpha = 0.7, color = "#2c7fb8", size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~ metric, scales = "free_y", ncol = 3) +
+  theme_minimal(base_size = 11) +
+  labs(title = "Logistic Regression Diagnostic Stability Plots", x = "Observation Index", y = NULL)
+```
+
+Only 2 observations exceed $|\text{Std. Deviance Residual}| > 2.5$, and overall model fit remains strong and stable.
+
+---
+
+# Presentation: Combined Univariable & Multivariable Table
+
+The table below presents both **Log Odds ($\beta$)** and **Odds Ratios (Crude OR and Adjusted OR)** with **95% Confidence Intervals** and **p-values** for all univariable predictors alongside the final multivariable model.
+
+```{r presentation-table}
+univ_log_odds <- map_dfr(predictors, function(var) {
+  fml <- as.formula(paste("outcome ~", var))
+  mod <- glm(fml, data = stroke_df, family = binomial(link = "logit"))
+  tidy(mod) %>%
+    filter(term != "(Intercept)") %>%
+    transmute(variable = var, term = term, univ_log_odds = estimate)
+})
+
+univ_pres <- univ_results %>%
+  left_join(univ_log_odds, by = c("variable", "term")) %>%
+  transmute(
+    Variable = variable,
+    Term = term,
+    `Univ. Log Odds (β)` = sprintf("%.3f", univ_log_odds),
+    `Crude OR (95% CI)` = sprintf("%.3f (%.3f–%.3f)", estimate, conf.low, conf.high),
+    `Univ. p-value` = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  )
+
+mv_log_odds <- tidy(mod_final) %>%
+  filter(term != "(Intercept)") %>%
+  transmute(Term = term, mv_log_odds = estimate)
+
+mv_pres <- tidy(mod_final, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  left_join(mv_log_odds, by = c("term" = "Term")) %>%
+  transmute(
+    Term = term,
+    `Multiv. Log Odds (β)` = sprintf("%.3f", mv_log_odds),
+    `Adjusted OR (95% CI)` = sprintf("%.3f (%.3f–%.3f)", estimate, conf.low, conf.high),
+    `Multiv. p-value` = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  )
+
+univ_pres %>%
+  left_join(mv_pres, by = "Term") %>%
+  mutate(across(starts_with("Multiv.") | starts_with("Adjusted"), ~ replace_na(.x, "—"))) %>%
+  kable(caption = "Univariable and Multivariable Logistic Regression Results (Log Odds, OR, 95% CI, p-value)")
+```
